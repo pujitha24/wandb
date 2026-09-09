@@ -114,7 +114,7 @@ const (
 	SweepSchedulerServerDoneTask_REASON_SWEEP_FINISHED SweepSchedulerServerDoneTask_Reason = 3
 	// The sweep was deleted.
 	SweepSchedulerServerDoneTask_REASON_SWEEP_NOT_FOUND SweepSchedulerServerDoneTask_Reason = 4
-	// A fatal backend error, too many consecutive errors, or a result
+	// A backend error the scheduler cannot retry past, or a result
 	// that did not answer the task the scheduler issued last.
 	SweepSchedulerServerDoneTask_REASON_FATAL_ERROR SweepSchedulerServerDoneTask_Reason = 5
 	// The client reported a task error.

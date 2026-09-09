@@ -214,7 +214,7 @@ message SweepSchedulerServerDoneTask {
     // The sweep was deleted.
     REASON_SWEEP_NOT_FOUND = 4;
 
-    // A fatal backend error, too many consecutive errors, or a result
+    // A backend error the scheduler cannot retry past, or a result
     // that did not answer the task the scheduler issued last.
     REASON_FATAL_ERROR = 5;
 

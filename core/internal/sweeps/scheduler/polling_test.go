@@ -1,6 +1,7 @@
 package scheduler_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -338,45 +339,56 @@ func TestFatalPollErrorEndsLoopImmediately(t *testing.T) {
 		done.GetDone().Reason)
 }
 
-func TestTransientPollErrorsGiveUpEventually(t *testing.T) {
+func TestPollErrorEndsTheScheduler(t *testing.T) {
 	fixture := newLoopFixture(t, scheduler.SchedulerParams{})
 	fixture.warmTo(t)
 	fixture.stubPoll(pollJSON("RUNNING", false, ""))
 	fixture.step(t, warmResult(nil))
 
-	result := emptyIterResult()
-	for polls := 0; ; polls++ {
-		require.Less(t, polls, 11, "the loop never gave up")
+	// The HTTP client has already retried a 502 by the time the loop
+	// sees it, so polling again is not what would make it succeed.
+	fixture.client.StubMatchWithError(
+		gqlmock.WithOpName("SweepRunsWithHistory"),
+		&graphql.HTTPError{StatusCode: 502},
+	)
+	task := fixture.step(t, emptyIterResult())
 
-		fixture.client.StubMatchWithError(
-			gqlmock.WithOpName("SweepRunsWithHistory"),
-			&graphql.HTTPError{StatusCode: 502},
-		)
-		task := fixture.step(t, result)
-		if done := task.GetDone(); done != nil {
-			assert.Equal(t,
-				spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR,
-				done.Reason)
-			assert.Contains(t, done.Message, "too many consecutive")
-			break
-		}
-		// Empty tasks while the backend misbehaves.
-		assert.Empty(t, task.GetGeneration().Updates)
-	}
+	done := task.GetDone()
+	require.NotNil(t, done)
+	assert.Equal(t,
+		spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR, done.Reason)
 }
 
-func TestTransientEnqueueFailureDiscardsAndContinues(t *testing.T) {
+func TestRateLimitedPollKeepsGoing(t *testing.T) {
+	fixture := newLoopFixture(t, scheduler.SchedulerParams{})
+	fixture.warmTo(t)
+	fixture.stubPoll(pollJSON("RUNNING", false, ""))
+	fixture.step(t, warmResult(nil))
+
+	fixture.client.StubMatchWithError(
+		gqlmock.WithOpName("SweepRunsWithHistory"),
+		&graphql.HTTPError{StatusCode: 429},
+	)
+	task := fixture.step(t, emptyIterResult())
+
+	// An empty task while the backend asks for a slower pace.
+	generation := task.GetGeneration()
+	require.NotNil(t, generation)
+	assert.Empty(t, generation.Updates)
+}
+
+func TestRateLimitedEnqueueDiscardsAndContinues(t *testing.T) {
 	fixture := newLoopFixture(t, scheduler.SchedulerParams{BatchSize: 2})
 	fixture.warmTo(t)
 	fixture.stubPoll(pollJSON("RUNNING", false, ""))
 	fixture.step(t, warmResult(nil))
 
-	// A 502 is retryable, so it costs only this suggestion: the error
-	// budget, not one failed enqueue, decides when the loop gives up.
+	// A rate limit costs only this suggestion; the loop slows down and
+	// carries on.
 	fixture.stubSweepConfig("RUNNING")
 	fixture.client.StubMatchWithError(
 		gqlmock.WithOpName("EnqueueSweepRun"),
-		&graphql.HTTPError{StatusCode: 502},
+		&graphql.HTTPError{StatusCode: 429},
 	)
 	fixture.stubPoll(pollJSON("RUNNING", false, ""))
 	task := fixture.step(t, generationResult(suggest("opt-lost")))
@@ -719,11 +731,11 @@ func TestWarmPageReclassifiesFinishedWithoutMetric(t *testing.T) {
 		warmStart.FinishedRuns[0].State)
 }
 
-func TestWarmPageErrorRetriesThePage(t *testing.T) {
+func TestRateLimitedWarmPageRetriesThePage(t *testing.T) {
 	fixture := newLoopFixture(t, scheduler.SchedulerParams{})
 	fixture.client.StubMatchWithError(
 		gqlmock.WithOpName("SweepRunsWithHistory"),
-		&graphql.HTTPError{StatusCode: 500},
+		&graphql.HTTPError{StatusCode: 429},
 	)
 
 	task := fixture.step(t, nil)
@@ -750,27 +762,31 @@ func TestWarmPageErrorRetriesThePage(t *testing.T) {
 	assert.True(t, fixture.client.AllStubsUsed())
 }
 
-func TestWarmStartGivesUpOnceTheErrorBudgetIsSpent(t *testing.T) {
-	fixture := newLoopFixture(t, scheduler.SchedulerParams{})
+func TestWarmPageErrorEndsTheScheduler(t *testing.T) {
+	// Only a rate limit leaves the page worth re-reading; everything
+	// else has already outlived the HTTP client's retries. An empty
+	// warm-start task would tell the optimizer this page held no prior
+	// runs, so it must never stand in for one of these.
+	for name, err := range map[string]error{
+		"server error":    &graphql.HTTPError{StatusCode: 500},
+		"forbidden":       &graphql.HTTPError{StatusCode: 403},
+		"bad request":     &graphql.HTTPError{StatusCode: 400},
+		"retries used up": errors.New("giving up after 20 attempt(s)"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newLoopFixture(t, scheduler.SchedulerParams{})
+			fixture.client.StubMatchWithError(
+				gqlmock.WithOpName("SweepRunsWithHistory"), err)
 
-	// Retrying costs the same budget a poll has; once it is spent the
-	// session ends rather than retrying forever.
-	var task *spb.SweepSchedulerServerNextTaskResponse
-	for range 20 {
-		fixture.client.StubMatchWithError(
-			gqlmock.WithOpName("SweepRunsWithHistory"),
-			&graphql.HTTPError{StatusCode: 500},
-		)
-		task = fixture.step(t, nil)
-		if task.GetDone() != nil {
-			break
-		}
-		require.NotNil(t, task.GetWarmStart())
+			task := fixture.step(t, nil)
+
+			require.Nil(t, task.GetWarmStart(),
+				"warm start reported an empty page for an unretryable error")
+			done := task.GetDone()
+			require.NotNil(t, done, "warm start retried an unretryable page")
+			assert.Equal(t,
+				spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR,
+				done.Reason)
+		})
 	}
-
-	done := task.GetDone()
-	require.NotNil(t, done, "warm start retried past its error budget")
-	assert.Equal(t,
-		spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR, done.Reason)
-	assert.Contains(t, done.Message, "too many consecutive errors")
 }

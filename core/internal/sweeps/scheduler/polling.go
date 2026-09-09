@@ -19,13 +19,22 @@ func (s *Scheduler) warmStartStep(
 ) *spb.SweepSchedulerServerNextTaskResponse {
 	page, err := s.api.PollPage(ctx, warmStartPageSize, s.warmCursor, s.metricKey)
 	if err != nil {
-		if done := s.doneFromError(ctx, err); done != nil {
-			return done
+		// An empty page says this page of the sweep held no prior runs,
+		// which is only true while the loop still means to read it
+		// again. So only an error that leaves the page worth re-reading
+		// may be answered that way: a rate limit. Anything else has
+		// already outlived the client's retries, and warm-starting the
+		// optimizer on runs it will never be told about is worse than
+		// stopping.
+		if !retryable(ctx, err) {
+			return s.doneFromError(ctx, err)
 		}
+
 		// Keep the cursor and retry this page rather than skipping the
-		// rest of the warm start
+		// rest of the warm start.
 		s.logger.Warn(
-			"scheduler: warm-start page failed; retrying it", "error", err)
+			"scheduler: warm-start page rate limited; retrying it",
+			"error", err)
 		if done := s.sleep(ctx); done != nil {
 			return done
 		}
@@ -120,11 +129,12 @@ func (s *Scheduler) doneFromError(
 // endFromError maps a failed call onto the reason the loop should end
 // with, or nil if it should keep going. The API layer already recorded
 // the failure in the backoff.
+//
+// Only a rate limit keeps the loop going: the HTTP client has already
+// spent its retries on anything else, so calling again is not what makes
+// it succeed.
 func (s *Scheduler) endFromError(ctx context.Context, err error) *endReason {
-	// Cancellation is shutdown, not a backend failure. Deadlines go
-	// through Classify, which treats them as transient.
-	if errors.Is(ctx.Err(), context.Canceled) ||
-		errors.Is(err, context.Canceled) {
+	if isShutdown(ctx, err) {
 		return &endReason{
 			reason: spb.SweepSchedulerServerDoneTask_REASON_SHUTDOWN,
 		}
@@ -136,21 +146,39 @@ func (s *Scheduler) endFromError(ctx context.Context, err error) *endReason {
 			reason:  spb.SweepSchedulerServerDoneTask_REASON_SWEEP_NOT_FOUND,
 			message: "the sweep was deleted",
 		}
-	case DispositionFatal:
+	case DispositionRateLimited:
+		// The backoff has already widened the next wait.
+		s.logger.Warn("scheduler: rate limited by the backend", "error", err)
+		return nil
+	default:
 		return &endReason{
 			reason:  spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR,
 			message: err.Error(),
 		}
-	default:
-		if s.api.Exhausted() {
-			return &endReason{
-				reason:  spb.SweepSchedulerServerDoneTask_REASON_FATAL_ERROR,
-				message: "too many consecutive errors; last: " + err.Error(),
-			}
-		}
-		s.logger.Warn("scheduler: transient failure", "error", err)
-		return nil
 	}
+}
+
+// isShutdown reports whether a failed call is the scheduler shutting
+// down rather than the backend failing.
+func isShutdown(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.Canceled) ||
+		errors.Is(err, context.Canceled)
+}
+
+// retryable reports whether making the same call again is what fixes
+// err, so a step may answer with a placeholder task and come back to it.
+//
+// Only a rate limit is: the HTTP client has already spent its retries on
+// everything else, and a step that keeps calling would leave the run it
+// was about to schedule in limbo instead of discarding it. Shutdown is
+// never retryable — the next call would be cancelled too.
+//
+// This is the positive form of endFromError's decision, for a step whose
+// placeholder task claims something about the sweep that only holds
+// while the step still means to retry.
+func retryable(ctx context.Context, err error) bool {
+	return !isShutdown(ctx, err) &&
+		Classify(err) == DispositionRateLimited
 }
 
 // finishExhausted ends the sweep because the search space ran out.
@@ -218,7 +246,7 @@ func (s *Scheduler) generationStep(
 		if done := s.doneFromError(ctx, err); done != nil {
 			return done
 		}
-		// Transient: deliver an empty task and try again next poll.
+		// Rate limited: deliver an empty task and try again next poll.
 		return s.generationTask(nil, nil, 0)
 	}
 	s.noteBackendState(snapshot)
@@ -571,8 +599,8 @@ func (s *Scheduler) enqueueOne(
 		s.logger.Error(
 			"scheduler: failed to enqueue a suggestion",
 			"id", id, "error", err)
-		// A transient failure costs only this suggestion; the error
-		// budget decides when a run of them ends the scheduler.
+		// A rate limit costs only this suggestion; anything else has
+		// already outlived the client's retries and ends the scheduler.
 		return s.endFromError(ctx, err)
 	}
 
